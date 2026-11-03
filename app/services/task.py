@@ -18,6 +18,7 @@ from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
 from app.services import bgm as bgm_service
 from app.services import (
+    agnes_video,
     codex_image,
     codex_oauth,
     elevenlabs_music,
@@ -103,6 +104,7 @@ _SUPPORTED_VIDEO_SOURCES = frozenset({
     "pexels", "pixabay", "coverr", "local", "wavespeed",
     "volcengine_seedance", "ofox", "metaso_minimax", "muapi",
     "loomloom", "openai_image", "codex_image", "infistar", "jalapeno",
+    "agnes_video", "agnes_image",
 })
 
 
@@ -931,6 +933,18 @@ def get_video_materials(
                 details=details,
             )
             return None
+        except agnes_video.AgnesVideoError as exc:
+            # Agnes 视频任务与 MuAPI 同样在受理后即计费。在任何模糊或完成
+            # 后的失败上保留远端 video_id，便于用户从服务商控制台恢复。
+            remote_task_id = str(getattr(exc, "task_id", "") or "").strip()
+            details = {"agnes_task_id": remote_task_id} if remote_task_id else None
+            _mark_task_failed(
+                task_id,
+                "materials",
+                str(exc),
+                details=details,
+            )
+            return None
         if not downloaded_videos:
             _mark_task_failed(
                 task_id,
@@ -1654,6 +1668,31 @@ def _run_pipeline(
             task_id,
             "preflight",
             "MuAPI video generation requires a MuAPI API key",
+        )
+
+    if (
+        stop_at in {"materials", "video"}
+        and params.video_source == "agnes_video"
+        and not agnes_video.is_enabled()
+    ):
+        return _mark_task_failed(
+            task_id,
+            "preflight",
+            "Agnes video generation requires an Agnes API key",
+        )
+
+    if (
+        stop_at in {"materials", "video"}
+        and params.video_source == "agnes_image"
+        and not material.is_agnes_image_enabled(
+            config.snapshot_config_with_pending(config.app)
+        )
+    ):
+        return _mark_task_failed(
+            task_id,
+            "preflight",
+            "Agnes image generation requires an Agnes API key "
+            "(agnes_image_api_keys in config.toml)",
         )
 
     if (

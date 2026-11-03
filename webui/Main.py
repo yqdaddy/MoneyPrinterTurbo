@@ -54,6 +54,7 @@ from app.services import (
     material,
     metaso_minimax,
     muapi,
+    agnes_video,
     infistar_video,
     jalapeno_video,
     ofox,
@@ -144,8 +145,9 @@ VIDEO_SOURCE_GROUPS = {
         "jalapeno",
         "wavespeed",
         "muapi",
+        "agnes_video",
     ),
-    "ai_image": ("openai_image", "codex_image"),
+    "ai_image": ("openai_image", "codex_image", "agnes_image"),
     "local": ("local",),
 }
 # Upload-Post 的 API Key 与发布用户分别在两个页面管理，并且发布用户名称
@@ -779,6 +781,8 @@ def _initialize_session_state():
         "ofox_confirm_charge": False,
         "metaso_minimax_confirm_charge": False,
         "muapi_confirm_charge": False,
+        "agnes_video_confirm_charge": False,
+        "agnes_image_confirm_charge": False,
         # AI 视频按素材段计费，默认只生成一段，用户确认效果后再主动增加数量。
         "loomloom_video_scene_count": _saved_ui_number(
             "loomloom_video_scene_count",
@@ -3414,6 +3418,8 @@ def _material_provider_labels():
         "jalapeno": tr("Jalapeno Cloud AI Video"),
         "wavespeed": tr("WaveSpeed AI Video"),
         "muapi": tr("MuAPI AI Video"),
+        "agnes_video": tr("Agnes AI Video"),
+        "agnes_image": tr("Agnes AI Image"),
         "openai_image": tr("OpenAI Compatible Text-to-Image"),
         "codex_image": tr("codex.image.label"),
         "local": tr("Local file"),
@@ -4076,6 +4082,74 @@ def _render_material_provider_settings(provider):
             "muapi_resolution",
             muapi_resolution.strip() or muapi.DEFAULT_RESOLUTION,
         )
+    elif provider == "agnes_video":
+        st.markdown(f"**{tr('Agnes AI Video')}**")
+
+        agnes_video_api_key = st.text_input(
+            tr("Agnes Video API Key"),
+            value=str(app_settings.get("agnes_video_api_key", "") or ""),
+            type="password",
+            help=tr("Agnes Video API Key Help"),
+            key="agnes_video_api_key_input",
+            on_change=_save_settings_change,
+            args=(
+                "app",
+                "agnes_video_api_key",
+                "agnes_video_api_key_input",
+                lambda value: value.strip(),
+            ),
+        )
+        _set_runtime_config("app", "agnes_video_api_key", agnes_video_api_key.strip())
+
+        configured_agnes_video_base_url = str(
+            app_settings.get("agnes_video_base_url", agnes_video.DEFAULT_BASE_URL)
+            or agnes_video.DEFAULT_BASE_URL
+        )
+        agnes_video_base_url = st.text_input(
+            tr("Agnes Video Base URL"),
+            value=""
+            if configured_agnes_video_base_url == agnes_video.DEFAULT_BASE_URL
+            else configured_agnes_video_base_url,
+            placeholder=agnes_video.DEFAULT_BASE_URL,
+            key="agnes_video_base_url_input",
+            on_change=_save_settings_change,
+            args=(
+                "app",
+                "agnes_video_base_url",
+                "agnes_video_base_url_input",
+                lambda value: value.strip() or agnes_video.DEFAULT_BASE_URL,
+            ),
+        )
+        _set_runtime_config(
+            "app",
+            "agnes_video_base_url",
+            agnes_video_base_url.strip() or agnes_video.DEFAULT_BASE_URL,
+        )
+
+        configured_agnes_video_model = str(
+            app_settings.get("agnes_video_model_name", agnes_video.DEFAULT_MODEL)
+            or agnes_video.DEFAULT_MODEL
+        )
+        agnes_video_model = st.text_input(
+            tr("Agnes Video Model"),
+            value=""
+            if configured_agnes_video_model == agnes_video.DEFAULT_MODEL
+            else configured_agnes_video_model,
+            placeholder=agnes_video.DEFAULT_MODEL,
+            key="agnes_video_model_input",
+            on_change=_save_settings_change,
+            args=(
+                "app",
+                "agnes_video_model_name",
+                "agnes_video_model_input",
+                lambda value: value.strip() or agnes_video.DEFAULT_MODEL,
+            ),
+        )
+        _set_runtime_config(
+            "app",
+            "agnes_video_model_name",
+            agnes_video_model.strip() or agnes_video.DEFAULT_MODEL,
+        )
     elif provider == "codex_image":
         st.markdown(f"**{tr('codex.image.label')}**")
         st.caption(tr("codex.image.help"))
@@ -4195,6 +4269,89 @@ def _render_material_provider_settings(provider):
                 "openai_image_prompt_template",
                 openai_image_prompt_template.strip(),
             )
+    elif provider == "agnes_image":
+        st.markdown(f"**{tr('Agnes AI Image')}**")
+
+        agnes_image_api_key = _get_material_api_keys("agnes_image_api_keys")
+        agnes_image_api_key = st.text_input(
+            tr("Agnes Image API Key"),
+            value=agnes_image_api_key,
+            type="password",
+            help=tr("Agnes Image API Key Help"),
+            key="agnes_image_api_keys_input",
+            on_change=_save_settings_api_keys,
+            args=("agnes_image_api_keys", "agnes_image_api_keys_input"),
+        )
+        _save_material_api_keys("agnes_image_api_keys", agnes_image_api_key)
+
+        configured_agnes_image_base_url = str(
+            app_settings.get(
+                "agnes_image_base_url", material.AGNES_IMAGE_DEFAULT_BASE_URL
+            )
+            or material.AGNES_IMAGE_DEFAULT_BASE_URL
+        )
+        agnes_image_base_url = st.text_input(
+            tr("Agnes Image Base URL"),
+            value=""
+            if configured_agnes_image_base_url == material.AGNES_IMAGE_DEFAULT_BASE_URL
+            else configured_agnes_image_base_url,
+            placeholder=material.AGNES_IMAGE_DEFAULT_BASE_URL,
+            key="agnes_image_base_url_input",
+            on_change=_save_settings_change,
+            args=(
+                "app",
+                "agnes_image_base_url",
+                "agnes_image_base_url_input",
+                lambda value: value.strip() or material.AGNES_IMAGE_DEFAULT_BASE_URL,
+            ),
+        )
+        _set_runtime_config(
+            "app",
+            "agnes_image_base_url",
+            agnes_image_base_url.strip() or material.AGNES_IMAGE_DEFAULT_BASE_URL,
+        )
+
+        configured_agnes_image_model = str(
+            app_settings.get("agnes_image_model", material.AGNES_IMAGE_DEFAULT_MODEL)
+            or material.AGNES_IMAGE_DEFAULT_MODEL
+        )
+        agnes_image_model = st.text_input(
+            tr("Agnes Image Model"),
+            value=""
+            if configured_agnes_image_model == material.AGNES_IMAGE_DEFAULT_MODEL
+            else configured_agnes_image_model,
+            placeholder=material.AGNES_IMAGE_DEFAULT_MODEL,
+            key="agnes_image_model_input",
+            on_change=_save_settings_change,
+            args=(
+                "app",
+                "agnes_image_model",
+                "agnes_image_model_input",
+                lambda value: value.strip() or material.AGNES_IMAGE_DEFAULT_MODEL,
+            ),
+        )
+        _set_runtime_config(
+            "app",
+            "agnes_image_model",
+            agnes_image_model.strip() or material.AGNES_IMAGE_DEFAULT_MODEL,
+        )
+
+        with st.expander(tr("Agnes Image Advanced Settings"), expanded=False):
+            agnes_image_size = st.text_input(
+                tr("Agnes Image Size"),
+                value=str(app_settings.get("agnes_image_size", "") or ""),
+                placeholder=material.AGNES_IMAGE_DEFAULT_SIZE,
+                help=tr("Agnes Image Size Help"),
+                key="agnes_image_size_input",
+                on_change=_save_settings_change,
+                args=(
+                    "app",
+                    "agnes_image_size",
+                    "agnes_image_size_input",
+                    lambda value: value.strip(),
+                ),
+            )
+            _set_runtime_config("app", "agnes_image_size", agnes_image_size.strip())
 
 
 @st.dialog(
@@ -6045,6 +6202,8 @@ def _render_video_settings(panel, params):
                 "ofox": tr("OFox AI Video"),
                 "metaso_minimax": tr("Metaso MiniMax H3"),
                 "muapi": tr("MuAPI AI Video"),
+                "agnes_video": tr("Agnes AI Video"),
+                "agnes_image": tr("Agnes AI Image"),
                 "loomloom": tr("Shengsuan Cloud AI Video"),
                 "openai_image": tr("OpenAI Compatible Text-to-Image"),
                 "codex_image": tr("codex.image.label"),
@@ -6098,6 +6257,10 @@ def _render_video_settings(panel, params):
                 st.caption(tr("Metaso MiniMax H3 Help"))
             if params.video_source == "muapi":
                 st.caption(tr("MuAPI AI Video Help"))
+            if params.video_source == "agnes_video":
+                st.caption(tr("Agnes AI Video Help"))
+            if params.video_source == "agnes_image":
+                st.caption(tr("Agnes AI Image Help"))
             if params.video_source == "local":
                 # Streamlit 的文件类型校验对扩展名大小写敏感，这里同时放行大小写两种形式。
                 local_file_types = sorted(
@@ -6241,7 +6404,12 @@ def _render_video_settings(panel, params):
                 "ui", "video_fit_mode", params.video_fit_mode.value
             )
 
-            if params.video_source in {"local", "openai_image", "codex_image"}:
+            if params.video_source in {
+                "local",
+                "openai_image",
+                "codex_image",
+                "agnes_image",
+            }:
                 image_motion_labels = {
                     ImageMotion.static.value: tr("Static Image"),
                     ImageMotion.zoom.value: tr("Slow Zoom"),
@@ -6282,6 +6450,13 @@ def _render_video_settings(panel, params):
                         muapi.DEFAULT_MAX_DURATION_SECONDS + 1,
                     )
                 )
+            elif params.video_source == "agnes_video":
+                video_clip_durations = list(
+                    range(
+                        agnes_video.DEFAULT_MIN_DURATION_SECONDS,
+                        agnes_video.DEFAULT_MAX_DURATION_SECONDS + 1,
+                    )
+                )
             else:
                 video_clip_durations = [2, 3, 4, 5, 6, 7, 8, 9, 10]
             params.video_clip_duration = stable_selectbox(
@@ -6291,7 +6466,7 @@ def _render_video_settings(panel, params):
                     "video_clip_duration",
                     video_clip_durations,
                     5
-                    if params.video_source in {"metaso_minimax", "muapi"}
+                    if params.video_source in {"metaso_minimax", "muapi", "agnes_video"}
                     else 3,
                 ),
                 key="video_clip_duration_select",
@@ -6412,6 +6587,10 @@ def _render_video_settings(panel, params):
                 _render_metaso_minimax_video_settings(params)
             if params.video_source == "muapi":
                 _render_muapi_video_settings(params)
+            if params.video_source == "agnes_video":
+                _render_agnes_video_settings(params)
+            if params.video_source == "agnes_image":
+                _render_agnes_image_settings(params)
     return uploaded_files
 
 
@@ -6694,6 +6873,52 @@ def _render_muapi_video_settings(params):
         tr("Confirm MuAPI Charge"),
         key="muapi_confirm_charge",
         help=tr("Confirm MuAPI Charge Help"),
+    )
+
+
+def _render_agnes_video_settings(params):
+    """Show an estimated Agnes video clip count and require explicit billing consent."""
+    clip_duration = max(int(params.video_clip_duration or 1), 1)
+    video_count = max(int(params.video_count or 1), 1)
+    if estimated_range := _estimate_voiceover_duration_range(
+        str(params.video_script or ""), params.voice_rate
+    ):
+        min_clips = max(math.ceil(estimated_range[0] * video_count / clip_duration), 1)
+        max_clips = max(
+            math.ceil(estimated_range[1] * video_count / clip_duration), min_clips
+        )
+        st.warning(
+            tr("Agnes Video Billing Notice").format(min=min_clips, max=max_clips)
+        )
+    else:
+        st.warning(tr("Agnes Video Billing Notice Without Script"))
+    st.checkbox(
+        tr("Confirm Agnes Video Charge"),
+        key="agnes_video_confirm_charge",
+        help=tr("Confirm Agnes Video Charge Help"),
+    )
+
+
+def _render_agnes_image_settings(params):
+    """Show an estimated Agnes image count and require explicit billing consent."""
+    clip_duration = max(int(params.video_clip_duration or 1), 1)
+    video_count = max(int(params.video_count or 1), 1)
+    if estimated_range := _estimate_voiceover_duration_range(
+        str(params.video_script or ""), params.voice_rate
+    ):
+        min_images = max(math.ceil(estimated_range[0] * video_count / clip_duration), 1)
+        max_images = max(
+            math.ceil(estimated_range[1] * video_count / clip_duration), min_images
+        )
+        st.warning(
+            tr("Agnes Image Billing Notice").format(min=min_images, max=max_images)
+        )
+    else:
+        st.warning(tr("Agnes Image Billing Notice Without Script"))
+    st.checkbox(
+        tr("Confirm Agnes Image Charge"),
+        key="agnes_image_confirm_charge",
+        help=tr("Confirm Agnes Image Charge Help"),
     )
 
 
@@ -9064,6 +9289,8 @@ def _render_generation_controls(
             "ofox",
             "metaso_minimax",
             "muapi",
+            "agnes_video",
+            "agnes_image",
             "loomloom",
             "openai_image",
             "codex_image",
@@ -9192,6 +9419,36 @@ def _render_generation_controls(
         ):
             _remove_active_generation_task(task_id)
             st.error(tr("Confirm MuAPI Charge Required"))
+            st.stop()
+
+        if params.video_source == "agnes_video" and not (
+            agnes_video.is_enabled(config.snapshot_config_with_pending(config.app))
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(tr("Please Enter the Agnes API Key"))
+            st.stop()
+
+        if params.video_source == "agnes_video" and not st.session_state.get(
+            "agnes_video_confirm_charge", False
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(tr("Confirm Agnes Video Charge Required"))
+            st.stop()
+
+        if params.video_source == "agnes_image" and not (
+            material.is_agnes_image_enabled(
+                config.snapshot_config_with_pending(config.app)
+            )
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(tr("Please Configure the Agnes Image Source"))
+            st.stop()
+
+        if params.video_source == "agnes_image" and not st.session_state.get(
+            "agnes_image_confirm_charge", False
+        ):
+            _remove_active_generation_task(task_id)
+            st.error(tr("Confirm Agnes Image Charge Required"))
             st.stop()
 
         if params.video_source == "codex_image":

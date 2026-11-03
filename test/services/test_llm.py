@@ -704,6 +704,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "cloudflare",
                 "modelscope",
                 "aihubmix",
+                "agnes",
                 "aimlapi",
                 "evolink",
                 "openrouter",

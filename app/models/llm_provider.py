@@ -465,6 +465,14 @@ LLM_PROVIDER_REGISTRY = (
         default_base_url="https://aihubmix.com/v1",
     ),
     LLMProviderSpec(
+        "agnes",
+        "Agnes AI",
+        api_key_url="https://www.agnes-ai.cn/",
+        default_model="agnes-3.0-flash",
+        default_base_url="https://api.agnes-ai.cn/v1",
+        model_docs_url="https://www.agnes-ai.cn/zh-Hans/docs/agnes-30-flash",
+    ),
+    LLMProviderSpec(
         "aimlapi",
         "AIML API",
         api_key_url="https://aimlapi.com/app/keys",

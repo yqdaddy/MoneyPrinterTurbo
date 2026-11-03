@@ -24,6 +24,7 @@ from PIL import Image, UnidentifiedImageError
 from app.config import config
 from app.models.schema import ImageMotion, MaterialInfo, VideoAspect, VideoConcatMode
 from app.services import (
+    agnes_video,
     codex_image,
     generation_progress,
     infistar_video,
@@ -1476,6 +1477,66 @@ def _openai_image_size(video_aspect: VideoAspect) -> str:
     return OPENAI_IMAGE_DEFAULT_SIZES.get(VideoAspect(video_aspect), "1024x1024")
 
 
+# Agnes Image 2.5 Flash 走同一个 /images/generations 端点，但语义不同：
+# ``size`` 是清晰度档位（"1K"-"4K"）而非像素尺寸，画幅由 ``ratio`` 表达
+# （取值与 VideoAspect 枚举一致），文档未定义 ``n`` 参数，不得发送。
+AGNES_IMAGE_DEFAULT_BASE_URL = "https://api.agnes-ai.cn/v1"
+AGNES_IMAGE_DEFAULT_MODEL = "agnes-image-2.5-flash"
+AGNES_IMAGE_DEFAULT_SIZE = "2K"
+AGNES_IMAGE_API_KEYS_CFG_KEY = "agnes_image_api_keys"
+
+
+def is_agnes_image_enabled(app_config: dict | None = None) -> bool:
+    """
+    判断 Agnes 文生图素材源是否已完成最小配置。
+
+    Agnes 是云端付费服务，API Key 必填（与可对接本地免鉴权网关的
+    openai_image 不同）；base_url 与 model 留空时使用 Agnes 官方默认值，
+    因此可用性实际由 key 是否配置决定。
+    """
+    app_config = config.app if app_config is None else app_config
+    base_url = str(
+        app_config.get("agnes_image_base_url", AGNES_IMAGE_DEFAULT_BASE_URL)
+        or AGNES_IMAGE_DEFAULT_BASE_URL
+    ).strip()
+    model = str(
+        app_config.get("agnes_image_model", AGNES_IMAGE_DEFAULT_MODEL)
+        or AGNES_IMAGE_DEFAULT_MODEL
+    ).strip()
+    api_keys = app_config.get(AGNES_IMAGE_API_KEYS_CFG_KEY)
+    if isinstance(api_keys, (list, tuple)):
+        has_key = any(str(key or "").strip() for key in api_keys)
+    else:
+        has_key = bool(str(api_keys or "").strip())
+    return bool(base_url and model and has_key)
+
+
+def _agnes_image_endpoint() -> tuple[str, str]:
+    """读取 Agnes 文生图端点与模型名，留空时回退官方默认值。"""
+    base_url = str(
+        config.app.get("agnes_image_base_url", AGNES_IMAGE_DEFAULT_BASE_URL)
+        or AGNES_IMAGE_DEFAULT_BASE_URL
+    ).strip().rstrip("/")
+    model = str(
+        config.app.get("agnes_image_model", AGNES_IMAGE_DEFAULT_MODEL)
+        or AGNES_IMAGE_DEFAULT_MODEL
+    ).strip()
+    return f"{base_url}/{OPENAI_IMAGE_ENDPOINT_PATH}", model
+
+
+def _agnes_image_size(video_aspect: VideoAspect) -> str:
+    """
+    解析 Agnes 请求的清晰度档位。
+
+    档位与画幅无关（画幅由 ratio 单独表达），统一默认 ``2K``；
+    ``agnes_image_size`` 可显式配置为 ``1K``-``4K`` 覆盖。
+    """
+    configured = str(config.app.get("agnes_image_size", "") or "").strip()
+    if configured:
+        return configured
+    return AGNES_IMAGE_DEFAULT_SIZE
+
+
 def _openai_image_prompt(search_term: str) -> str:
     """
     把脚本关键词包装成最终提示词。
@@ -1647,7 +1708,11 @@ def _parse_openai_image_response(
     return None, "image response has neither url nor b64_json"
 
 
-def _request_openai_image(endpoint: str, payload: dict) -> tuple[bytes | None, str]:
+def _request_openai_image(
+    endpoint: str,
+    payload: dict,
+    api_keys_cfg_key: str = "openai_image_api_keys",
+) -> tuple[bytes | None, str]:
     """
     调用 OpenAI 兼容 /images/generations 接口，带退避重试与 key 轮换。
 
@@ -1663,7 +1728,7 @@ def _request_openai_image(endpoint: str, payload: dict) -> tuple[bytes | None, s
     API Key 允许为空：完全本地的 ComfyUI/SD 网关通常不需要鉴权，为空时
     不发送 Authorization 头。
     """
-    api_keys = config.app.get("openai_image_api_keys")
+    api_keys = config.app.get(api_keys_cfg_key)
     if isinstance(api_keys, (list, tuple)):
         configured_keys = [k for k in api_keys if str(k or "").strip()]
     elif str(api_keys or "").strip():
@@ -1673,7 +1738,7 @@ def _request_openai_image(endpoint: str, payload: dict) -> tuple[bytes | None, s
 
     failure_detail = "no request attempt was made"
     for attempt in range(1, OPENAI_IMAGE_MAX_ATTEMPTS + 1):
-        api_key = get_api_key("openai_image_api_keys") if configured_keys else ""
+        api_key = get_api_key(api_keys_cfg_key) if configured_keys else ""
         headers = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -1852,6 +1917,76 @@ def generate_images_openai(
     item.duration = clip_duration
     item.source_info = {
         "provider": "openai_image",
+        "search_term": search_term,
+        "rendition": {
+            "id": None,
+            "width": width,
+            "height": height,
+        },
+    }
+    return [item]
+
+
+def generate_images_agnes(
+    search_term: str,
+    minimum_duration: int,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    save_dir: str = "",
+) -> List[MaterialInfo]:
+    """
+    用 Agnes 文生图接口为一个脚本关键词生成一张图片并保存到本地。
+
+    与 generate_images_openai 保持同一签名和空列表失败约定，供按需生成
+    流程注入复用。Agnes 与 OpenAI 兼容层的请求差异（size 档位制、ratio
+    表达画幅、无 n 参数）在这里收敛；计费安全的重试与解析语义全部继承
+    ``_request_openai_image``。
+    """
+    if not is_agnes_image_enabled():
+        # Agnes 是云端付费服务，缺 key 的请求必然被拒。先于任何付费请求
+        # 快速失败，与 _openai_image_endpoint 缺配置时的行为一致。
+        raise ValueError(
+            "\n\n##### agnes_image_api_keys is not set #####\n\n"
+            f"Please set it in the config.toml file: {config.config_file}\n"
+        )
+
+    aspect = VideoAspect(video_aspect)
+    clip_duration = max(int(minimum_duration), 1)
+    endpoint, model = _agnes_image_endpoint()
+    payload = {
+        "model": model,
+        "prompt": search_term,
+        "size": _agnes_image_size(aspect),
+        "ratio": aspect.value,
+    }
+    logger.info(
+        f"generating image with Agnes: model={model}, term={search_term!r}, "
+        f"size={payload['size']}, ratio={payload['ratio']}"
+    )
+    generation_progress.submitting("agnes_image")
+    image_bytes, failure_detail = _request_openai_image(
+        endpoint, payload, api_keys_cfg_key=AGNES_IMAGE_API_KEYS_CFG_KEY
+    )
+    if image_bytes is None:
+        logger.error(
+            f"agnes image generation failed: term={search_term!r}, "
+            f"detail={failure_detail}"
+        )
+        return []
+
+    try:
+        image_path, width, height = _save_openai_image_file(image_bytes, save_dir)
+    except _OpenAIImageDecodeError as e:
+        logger.error(
+            "agnes image response is not a decodable image, skipping term: "
+            f"term={search_term!r}, error={type(e).__name__}, detail={e}"
+        )
+        return []
+    item = MaterialInfo()
+    item.provider = "agnes_image"
+    item.url = image_path
+    item.duration = clip_duration
+    item.source_info = {
+        "provider": "agnes_image",
         "search_term": search_term,
         "rendition": {
             "id": None,
@@ -2461,6 +2596,17 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
         )
+    if source == "agnes_video":
+        # Agnes 视频端点同样按远端异步任务计费。逐段提交并在覆盖配音时长
+        # 后立即停止，避免为未使用的脚本关键词产生付费任务。
+        return _download_videos_agnes_video_on_demand(
+            task_id=task_id,
+            search_terms=search_terms,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            material_directory=material_directory,
+        )
     if source == "metaso_minimax":
         # 秘塔 MiniMax 同样按远端异步任务计费。它与火山方舟的请求体相似，
         # 但任务查询路径和响应结构不同，因此只共享本地按需生成语义，不复用
@@ -2473,7 +2619,7 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
         )
-    if source in {"openai_image", "codex_image"}:
+    if source in {"openai_image", "codex_image", "agnes_image"}:
         # 与 WaveSpeed 相同的按需付费语义：文生图按张计费，逐段生成、凑够
         # 所需时长立即停止。生成结果是一次性的本地图片文件，也不参与 24
         # 小时搜索缓存——缓存会让不同任务反复拿到同一张图。
@@ -2483,6 +2629,12 @@ def download_videos(
                 "image_generator": generate_images_codex,
                 "provider": source,
                 "codex_image_context": codex_image_context,
+            }
+        elif source == "agnes_image":
+            # 复用 openai_image 的按需付费管线，只注入 Agnes 专属生成器。
+            image_options = {
+                "image_generator": generate_images_agnes,
+                "provider": source,
             }
         return _download_videos_openai_image_on_demand(
             task_id=task_id,
@@ -3064,6 +3216,128 @@ def _download_videos_muapi_on_demand(
             break
 
     logger.success(f"generated and downloaded {len(video_paths)} MuAPI videos")
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
+def _download_videos_agnes_video_on_demand(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+) -> List[str]:
+    """Generate Agnes materials until the narration duration is covered."""
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+
+    try:
+        required_duration = float(audio_duration)
+    except (TypeError, ValueError) as exc:
+        raise agnes_video.AgnesVideoError(
+            "Agnes audio duration must be a finite number"
+        ) from exc
+    if not math.isfinite(required_duration):
+        raise agnes_video.AgnesVideoError(
+            "Agnes audio duration must be a finite number"
+        )
+    if required_duration <= 0:
+        logger.warning(
+            "skip Agnes paid generation because required audio duration is "
+            f"not positive: duration={required_duration}"
+        )
+        _persist_material_sources(task_id, material_sources)
+        return video_paths
+
+    try:
+        clip_duration = int(max_clip_duration)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise agnes_video.AgnesVideoError(
+            "Agnes clip duration must be a positive integer"
+        ) from exc
+    if clip_duration <= 0:
+        raise agnes_video.AgnesVideoError(
+            "Agnes clip duration must be a positive integer"
+        )
+
+    total_duration = 0.0
+    for search_term in search_terms:
+        try:
+            video_items = agnes_video.generate_videos(
+                search_term=search_term,
+                minimum_duration=clip_duration,
+                video_aspect=video_aspect,
+            )
+        except agnes_video.AgnesVideoUnconfirmedTaskError as exc:
+            # 远端付费任务状态未知时必须停止循环：换下一个关键词重试可能
+            # 造成重复计费。保留任务 ID 供任务服务恢复使用。
+            logger.error(
+                "stop submitting new Agnes tasks because the last paid task "
+                f"is unconfirmed: task_id={exc.task_id or 'unknown'}, "
+                f"detail={exc}"
+            )
+            _persist_material_sources(task_id, material_sources)
+            raise
+        except agnes_video.AgnesVideoError as exc:
+            logger.error(f"Agnes generation failed before completion: {exc}")
+            _persist_material_sources(task_id, material_sources)
+            raise
+
+        for item in video_items:
+            saved_video_path = _save_generated_video_with_retry(
+                item.url, material_directory, "agnes_video"
+            )
+            if not saved_video_path:
+                # 远端任务已完成并可能已计费。下载失败后不提交替代任务，
+                # 返回远端 ID 供手动恢复。
+                source_info = (
+                    item.source_info if isinstance(item.source_info, dict) else {}
+                )
+                remote_task_id = str(source_info.get("asset_id") or "").strip()
+                _persist_material_sources(task_id, material_sources)
+                raise agnes_video.AgnesVideoDownloadError(
+                    "Agnes generated a paid video but the result could not be "
+                    f"downloaded: id={remote_task_id or 'unknown'}",
+                    task_id=remote_task_id,
+                )
+            logger.info(f"video saved: {saved_video_path}")
+            video_paths.append(saved_video_path)
+            try:
+                material_sources.append(_material_source_record(item, saved_video_path))
+            except Exception as source_error:
+                logger.warning(
+                    "failed to prepare generated material source record: "
+                    f"provider=agnes_video, error={type(source_error).__name__}, "
+                    f"detail={source_error}"
+                )
+            try:
+                downloaded_duration = _get_downloaded_video_duration(saved_video_path)
+            except Exception as duration_error:
+                source_info = (
+                    item.source_info if isinstance(item.source_info, dict) else {}
+                )
+                remote_task_id = str(source_info.get("asset_id") or "").strip()
+                _persist_material_sources(task_id, material_sources)
+                raise agnes_video.AgnesVideoDownloadError(
+                    "Agnes generated a paid video but its downloaded duration "
+                    "could not be measured: "
+                    f"id={remote_task_id or 'unknown'}",
+                    task_id=remote_task_id,
+                ) from duration_error
+            total_duration += min(clip_duration, downloaded_duration)
+            if total_duration >= required_duration:
+                break
+        if total_duration >= required_duration:
+            logger.info(
+                "generated Agnes materials cover the required duration; stop "
+                f"submitting paid tasks: generated={total_duration:.1f}s, "
+                f"required={required_duration:.1f}s"
+            )
+            break
+
+    logger.success(f"generated and downloaded {len(video_paths)} Agnes videos")
     _persist_material_sources(task_id, material_sources)
     return video_paths
 
